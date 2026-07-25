@@ -267,7 +267,7 @@ struct GpuScalarHoistPass
           continue;
         }
 
-        if (!isIntOrIndex(hostDivisor.getType()))
+        if (!hostDivisor.getType().isInteger(32))
           hostDivisor = hostB.create<arith::IndexCastUIOp>(loc, i32Ty, hostDivisor);
 
         // --- Wrap magic/shift computation in scalar_hoist.precompute ---

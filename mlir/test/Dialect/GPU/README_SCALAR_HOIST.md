@@ -153,10 +153,62 @@ host function wrapping the magic-number computation.
 **Platform:** Intel Data Center GPU Max 1550 (Ponte Vecchio), 128 GB HBM2e
 **Profiling:** Intel unitrace (Level Zero kernel timing)
 
+#### BiasAdd (MLIR, 64M elements, 256MB f32)
+
 | Configuration | Elements | Kernel Args | Avg Latency (ns) | Speedup |
 |---------------|----------|-------------|-------------------|---------|
 | Baseline      | 67,108,864 | 6         | 588,641           | —       |
 | **Optimized** | 67,108,864 | **10**    | **518,163**       | **+13.6%** |
+
+#### GroupNorm (SYCL, N=1024 D=192 S=784, Welford + affine norm)
+
+| Configuration | Groups | Kernel Args | Avg Latency (ns) | Speedup |
+|---------------|--------|-------------|-------------------|---------|
+| Baseline (`c = (j+v) / S`) | 1024 | 9 | 1,093,440 | — |
+| **Optimized** (magic mul)   | 1024 | **11** | **766,861** | **+42.6%** |
+
+GroupNorm is compute-bound (Welford reduction + per-element affine norm
+with 4 divisions per vec-4 per iteration), so the division hoisting has
+a much larger impact than the bandwidth-bound BiasAdd.
+
+## 7. GroupNorm SYCL Benchmark
+
+### Source Files
+
+| File | Description |
+|------|-------------|
+| `mlir/test/Dialect/GPU/sycl/group-norm-baseline.cpp` | Baseline: `c = (j+v) / S` (runtime division) |
+| `mlir/test/Dialect/GPU/sycl/group-norm-optimized.cpp` | Optimized: host-precomputed magic multiply |
+
+### Build & Run
+
+```bash
+source /opt/intel/oneapi/2026.0/oneapi-vars.sh --force
+
+# Build
+icpx -fsycl -O2 -o gn_baseline  mlir/test/Dialect/GPU/sycl/group-norm-baseline.cpp
+icpx -fsycl -O2 -o gn_optimized mlir/test/Dialect/GPU/sycl/group-norm-optimized.cpp
+
+# Run with unitrace profiling
+unitrace -d ./gn_baseline  --N 1024 --D 192 --S 784 --G 1 --wg 1024 --iters 30
+unitrace -d ./gn_optimized --N 1024 --D 192 --S 784 --G 1 --wg 1024 --iters 30
+```
+
+### Key Difference (Pass 2 only)
+
+```cpp
+// BASELINE: genuine runtime division per element
+int32_t c = (j + v) / S;   // ~30 GPU cycles per division
+
+// OPTIMIZED: host-precomputed magic multiply (zero-cost on host)
+uint32_t q = (uint32_t)(((uint64_t)n * s_magic) >> 32);
+uint32_t c = s_add ? (((n - q) >> 1) + q) >> s_shift : (q >> s_shift);
+// ~6 GPU cycles (mulhi + shift)
+```
+
+The magic constants (`s_magic`, `s_shift`, `s_add`) are computed once on
+the CPU from the runtime value of S, verified exhaustively over [0, DS),
+and passed to the kernel as 3 additional scalar arguments.
 
 ## 7. Pass Pipeline (with scalar_hoist dialect)
 

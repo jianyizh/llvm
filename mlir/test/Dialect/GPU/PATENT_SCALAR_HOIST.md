@@ -86,8 +86,9 @@ scalar-only sub-expressions from mixed expressions; (2) hoists those
 sub-expressions from the GPU kernel to the host CPU, generating
 precomputation code as CPU-side operations; and (3) passes the
 precomputed results to the GPU kernel as additional parameters. A
-device-aware compiler IR (MLIR) models the computation devices
-explicitly, enabling type-safe cross-boundary expression migration.
+device-aware compiler IR dialect (`scalar_hoist`) models the
+precomputation and cross-device transfer explicitly, enabling
+type-safe cross-boundary expression migration within MLIR.
 
 ### 5.2 Advantages
 
@@ -97,13 +98,14 @@ identifying runtime scalar expressions (including algebraically
 restructured ones) and hoisting them across the host-device boundary;
 (2) it reduces GPU compute utilization by eliminating redundant
 per-work-item evaluation of these invariants across millions of
-work-items -- measured 18% kernel speedup on a 64M-element integer
-division workload on Intel Data Center GPU Max 1550, with 25%+ expected
-for compute-bound kernels with higher scalar expression density; (3)
-the CPU-side precomputation is effectively free -- it executes during
-command list preparation, hidden behind existing driver overhead. The
-device-aware IR approach ensures correctness and generality across GPU
-programming models (SYCL, OpenCL, CUDA).
+work-items -- measured 13-14% kernel speedup on a 64M-element
+bandwidth-bound workload on Intel Data Center GPU Max 1550, with
+higher speedups expected for compute-bound kernels; (3) the CPU-side
+precomputation is effectively free -- it executes during command list
+preparation, hidden behind existing driver overhead. The device-aware
+IR approach (the `scalar_hoist` dialect operating on MLIR's `gpu`
+dialect) ensures correctness and generality across GPU programming
+models (SYCL, OpenCL, CUDA).
 
 ## 6. DETECTABILITY
 
@@ -132,11 +134,13 @@ floating-point) preceding each kernel dispatch call. Compiler IR dumps
 show cross-boundary value transfer from host to device regions.
 
 **C. Product Literature:** Compiler documentation describing
-`gpu-scalar-hoist` pass, "scalar expression hoisting", "kernel-scope uniform
+`gpu-scalar-hoist` pass, `scalar_hoist` dialect, "scalar expression
+hoisting", "kernel-scope uniform
 expression precomputation", "magic number division hoisting", "scalar
 dependency classification", device-aware IR dialects for cross-boundary
 optimization, or compiler flags enabling such optimizations would
-indicate usage.
+indicate usage. Compiler IR dumps showing `scalar_hoist.precompute` or
+`scalar_hoist.yield` operations would be direct evidence.
 
 ## 7. DETAILS OF THE INVENTION
 
@@ -186,6 +190,171 @@ The method operates in four phases:
   new arguments (multiply-shift for integer division, multiply for
   floating-point division, direct use for transcendentals). Update
   **all** `gpu.launch_func` call sites consistently.
+
+---
+
+### DIALECT DESIGN: THE `scalar_hoist` DIALECT
+
+The method is realized through a device-aware compiler IR dialect
+(`scalar_hoist`) that explicitly models host-side precomputation and
+cross-device value transfer. The dialect is designed to work alongside
+MLIR's existing `gpu` dialect, which models the host-device boundary
+via `gpu.module`, `gpu.func`, and `gpu.launch_func`.
+
+#### Dialect Definition
+
+```tablegen
+def ScalarHoist_Dialect : Dialect {
+  let name = "scalar_hoist";
+  let summary = "Dialect for scalar expression hoisting from GPU to host";
+  let cppNamespace = "::mlir::scalar_hoist";
+  // Accepts ops defined programmatically (precompute, yield)
+  let hasNonDefaultDestructor = 0;
+}
+```
+
+#### Operations
+
+**`scalar_hoist.precompute`** -- Region-based op that wraps host-side
+scalar precomputation. Takes scalar kernel-arg values as inputs; the
+region body contains the computation (e.g., magic number algorithm);
+the region yields the precomputed results (e.g., magic and shift).
+
+```tablegen
+def ScalarHoist_PrecomputeOp : Op<ScalarHoist_Dialect, "precompute"> {
+  let summary = "Host-side scalar precomputation";
+  let description = [{
+    Wraps a scalar computation that will execute on the host CPU before
+    kernel launch. The region takes scalar divisor values as block
+    arguments and yields precomputed values (e.g., magic multiplier
+    and shift count for integer division strength reduction).
+
+    The precompute op makes the cross-boundary optimization explicit
+    in the IR: the region body shows WHAT is being precomputed, the
+    op's operands show the scalar inputs (kernel arguments), and the
+    op's results flow into gpu.launch_func as additional kernel args.
+  }];
+  let arguments = (ins Variadic<AnyType>:$inputs);
+  let results = (outs Variadic<AnyType>:$results);
+  let regions = (region SizedRegion<1>:$body);
+}
+```
+
+**`scalar_hoist.yield`** -- Terminator op for the precompute region.
+Returns computed values to the parent precompute op's results.
+
+```tablegen
+def ScalarHoist_YieldOp : Op<ScalarHoist_Dialect, "yield", [
+    Pure, Terminator, HasParent<"PrecomputeOp">
+]> {
+  let summary = "Yield from precompute region";
+  let arguments = (ins Variadic<AnyType>:$values);
+}
+```
+
+#### Dependency Classification Attributes
+
+Each SSA value in the GPU kernel is classified with one of four
+dependency classes. The classification is computed by forward dataflow
+analysis and stored in an in-memory map during pass execution:
+
+```cpp
+enum class DepClass : uint8_t {
+  SCALAR_ONLY,   // Uniform across all work-items (scalar kernel args,
+                 //   gpu.block_dim, expressions of scalars)
+  INDEX_ONLY,    // Varies per work-item (gpu.thread_id, buffer loads,
+                 //   expressions of indices)
+  MIXED,         // Depends on both scalar and index-dependent values
+  CONSTANT       // Compile-time constant (arith.constant)
+};
+```
+
+#### IR Representation
+
+**Before optimization (input IR):**
+
+```mlir
+func.func @dispatch(%data: memref<?xf32>, %scalar_a: f32) {
+  gpu.launch_func @compute::@kernel
+    args(%data, %scalar_a : memref<?xf32>, f32)
+  return
+}
+gpu.module @compute {
+  gpu.func @kernel(%data: memref<?xf32>, %scalar_a: f32) kernel {
+    %idx = gpu.thread_id x
+    %b = memref.load %data[%idx] : memref<?xf32>
+    %denom = arith.mulf %scalar_a, %b : f32     // MIXED
+    %result = arith.divf %b, %denom : f32        // MIXED - target
+    memref.store %result, %data[%idx] : memref<?xf32>
+    gpu.return
+  }
+}
+```
+
+**After `gpu-scalar-hoist` (scalar_hoist dialect ops visible):**
+
+```mlir
+func.func @dispatch(%data: memref<?xf32>, %scalar_a: f32) {
+  // Host-side precomputation wrapped in scalar_hoist dialect op
+  %inv_a = "scalar_hoist.precompute"(%scalar_a) ({
+  ^bb0(%a: f32):
+    %one = arith.constant 1.0 : f32
+    %r = arith.divf %one, %a : f32
+    "scalar_hoist.yield"(%r) : (f32) -> ()
+  }) : (f32) -> f32
+
+  // Launch with precomputed value as extra kernel arg
+  gpu.launch_func @compute::@kernel_optimized
+    args(%data, %scalar_a, %inv_a : memref<?xf32>, f32, f32)
+  return
+}
+gpu.module @compute {
+  // Optimized kernel: no per-work-item fdiv by scalar
+  gpu.func @kernel_optimized(%data: memref<?xf32>, %scalar_a: f32,
+                             %precomp_inv_a: f32) kernel {
+    %idx = gpu.thread_id x
+    %b = memref.load %data[%idx] : memref<?xf32>
+    %result = arith.mulf %precomp_inv_a, %b : f32  // uses precomp
+    memref.store %result, %data[%idx] : memref<?xf32>
+    gpu.return
+  }
+}
+```
+
+**After `lower-scalar-hoist` (dialect ops inlined, ready for lowering):**
+
+```mlir
+func.func @dispatch(%data: memref<?xf32>, %scalar_a: f32) {
+  %one = arith.constant 1.0 : f32
+  %inv_a = arith.divf %one, %scalar_a : f32   // inlined from precompute
+  gpu.launch_func @compute::@kernel_optimized
+    args(%data, %scalar_a, %inv_a : memref<?xf32>, f32, f32)
+  return
+}
+```
+
+#### Device-Aware Lowering
+
+The `scalar_hoist` dialect lowers to standard MLIR dialects via the
+`lower-scalar-hoist` pass:
+
+1. `scalar_hoist.precompute` → region body inlined into host
+   `func.func` (standard arith/math operations)
+2. `scalar_hoist.yield` → erased (values flow through SSA)
+3. Precomputed results → passed as additional kernel arguments via
+   existing `gpu.launch_func` ABI (scalar register passing,
+   no memory allocation)
+
+```
+Lowering pipeline:
+
+  scalar_hoist.precompute / scalar_hoist.yield
+    -> [lower-scalar-hoist]         // Inline regions, erase dialect ops
+    -> Standard arith/math ops in host func.func
+    -> [convert-gpu-to-spirv]       // GPU module -> SPIR-V
+    -> [convert-to-llvm]            // Host func -> LLVM IR
+    -> SPIR-V (device) + LLVM IR (host)
+```
 
 ---
 
@@ -939,30 +1108,49 @@ func.func @main() {
 
 **Platform:** Intel Data Center GPU Max 1550 (Ponte Vecchio), 128 GB HBM2e
 
-**Benchmark:** BiasAdd kernel -- `dst[i] = src[i] + bias[(i % chw) / hw]`
-
 **Profiling tool:** Intel unitrace (Level Zero kernel timing)
 
-| Configuration | Elements  | Blocks x Threads | Kernel Args | Avg Latency (ns) | Min Latency (ns) |
-|---------------|-----------|-------------------|-------------|-------------------|-------------------|
-| Baseline      | 67,108,864 | 262,144 x 256    | 6           | 588,641           | 579,840           |
-| **Optimized** | 67,108,864 | 262,144 x 256    | **10**      | **518,163**       | **507,680**       |
-| **Speedup**   |           |                   |             | **+13.6%**        | **+14.2%**        |
+#### Benchmark 1: BiasAdd (MLIR pipeline, memory-bandwidth-bound)
 
-**Analysis:**
-- Each work-item originally performs 2 integer divisions (`remui` + `divui`),
-  costing ~40-160 GPU cycles.
-- After optimization, each work-item performs 2 magic-multiply sequences,
-  costing ~16-20 GPU cycles.
-- Net saving: ~24-140 cycles per work-item x 67M work-items.
-- The 13-14% speedup on a 64M-element kernel demonstrates that integer
-  division overhead is significant even in memory-bandwidth-bound workloads
-  (512 MB data movement). In compute-bound kernels with higher division
-  density, larger speedups are expected.
-- Host-side precomputation cost: ~20 ns total for 4 values (2 magic +
-  2 shift), negligible compared to the ~500 us kernel execution.
+Kernel: `dst[i] = src[i] + bias[(i % chw) / hw]`
+- 2 integer divisions per work-item, 67M work-items
+- Memory-bandwidth-bound (512 MB data movement dominates)
 
-**SPIR-V binary signature comparison:**
+| Configuration | Elements  | Blocks x Threads | Kernel Args | Avg Latency (ns) |
+|---------------|-----------|-------------------|-------------|-------------------|
+| Baseline      | 67,108,864 | 262,144 x 256    | 6           | 588,641           |
+| **Optimized** | 67,108,864 | 262,144 x 256    | **10**      | **518,163**       |
+| **Speedup**   |           |                   |             | **+13.6%**        |
+
+#### Benchmark 2: GroupNorm (SYCL, compute-bound)
+
+Kernel: Full GroupNorm with Welford reduction + per-element affine norm
+- N=1024, D=192, S=784 (DS=150528 per group), 1024 work-items/group
+- Pass 2: 4 integer divisions per vec-4 per iteration (`c = (j+v) / S`)
+- ~148 divisions per work-item per pass
+- Compute-bound (Welford + affine + per-element division)
+
+| Configuration | Groups | Kernel Args | Avg Latency (ns) | Min Latency (ns) |
+|---------------|--------|-------------|-------------------|-------------------|
+| Baseline (`c = (j+v)/S`) | 1024 | 9 | 1,093,440 | 1,013,440 |
+| **Optimized** (magic mul) | 1024 | **11** | **766,861** | **728,800** |
+| **Speedup** | | | **+42.6%** | **+39.1%** |
+
+#### Analysis
+
+- **BiasAdd (+13.6%):** Bandwidth-bound workload. Division cost is
+  partially hidden by memory latency, but hoisting still provides
+  meaningful improvement.
+- **GroupNorm (+42.6%):** Compute-bound workload with high division
+  density. The optimization nearly halves the per-element normalization
+  cost because `c = j/S` (4x per vec-4) was the dominant ALU
+  bottleneck in Pass 2.
+- **Host-side precomputation cost:** ~20 ns on CPU (a few integer
+  operations), negligible vs. kernel execution (500-1100 us).
+- **Correctness:** The magic-number division is verified exhaustively
+  over the full valid input range [0, DS) before kernel launch.
+
+**SPIR-V binary signature comparison (BiasAdd):**
 
 ```
 Baseline kernel:  6 arguments, contains OpUDiv + OpUMod instructions
@@ -1162,4 +1350,7 @@ visible to a single compiler pass, enabling the pass to simultaneously
 | `mlir/include/mlir/Dialect/GPU/Transforms/Passes.td` | Pass registration (TableGen) |
 | `mlir/include/mlir/Dialect/GPU/Transforms/Passes.h` | Pass declarations |
 | `mlir/lib/Dialect/GPU/CMakeLists.txt` | Build configuration |
-| `mlir/test/Dialect/GPU/bias-add-benchmark.mlir` | BiasAdd benchmark (64M elements, f32) |
+| `mlir/test/Dialect/GPU/bias-add-benchmark.mlir` | BiasAdd MLIR benchmark (64M elements, f32) |
+| `mlir/test/Dialect/GPU/bias-add-runtime-shape.mlir` | BiasAdd MLIR benchmark (32M elements, index-typed args) |
+| `mlir/test/Dialect/GPU/sycl/group-norm-baseline.cpp` | GroupNorm SYCL baseline (runtime division) |
+| `mlir/test/Dialect/GPU/sycl/group-norm-optimized.cpp` | GroupNorm SYCL optimized (host-precomputed magic multiply) |
