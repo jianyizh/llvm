@@ -73,14 +73,15 @@ Expected output:
 [level_zero:gpu][level_zero:0] Intel(R) Data Center GPU Max 1550 ...
 ```
 
-## 6. BiasAdd Benchmark — 64M Elements
+## 6. BiasAdd Benchmark — 32M Elements (128MB)
 
 ### Source File
 
-`mlir/test/Dialect/GPU/bias-add-benchmark.mlir`
+`mlir/test/Dialect/GPU/bias-add-runtime-shape.mlir`
 
-- Shape: `tot=67108864 (64M), N=16, C=16, HW=262144, chw=4194304`
-- Grid: `262144 blocks × 256 threads`
+- Shape: `N=8, C=64, H=256, W=256 => tot=33554432 (32M, 128MB f32)`
+- `chw = C*H*W = 4194304, hw = H*W = 65536`
+- Grid: `131072 blocks × 256 threads`
 - Each work-item: `arith.remui + arith.divui + memref.load + arith.addf + memref.store`
 
 ### Run Baseline (no optimization)
@@ -89,7 +90,7 @@ Expected output:
 BUILD=/home2/jianyizh/llvm/build_imex
 
 $BUILD/bin/mlir-opt \
-  mlir/test/Dialect/GPU/bias-add-benchmark.mlir \
+  mlir/test/Dialect/GPU/bias-add-runtime-shape.mlir \
   -pass-pipeline='builtin.module(
     spirv-attach-target{ver=v1.0 caps=Addresses,Int64,Kernel},
     convert-gpu-to-spirv{use-64bit-index=true},
@@ -114,7 +115,7 @@ LD_LIBRARY_PATH=$BUILD/lib unitrace -d $BUILD/bin/mlir-runner \
 
 ```bash
 $BUILD/bin/mlir-opt \
-  mlir/test/Dialect/GPU/bias-add-benchmark.mlir \
+  mlir/test/Dialect/GPU/bias-add-runtime-shape.mlir \
   -pass-pipeline='builtin.module(
     gpu-scalar-hoist,
     lower-scalar-hoist,
@@ -141,7 +142,7 @@ LD_LIBRARY_PATH=$BUILD/lib unitrace -d $BUILD/bin/mlir-runner \
 
 ```bash
 $BUILD/bin/mlir-opt \
-  mlir/test/Dialect/GPU/bias-add-benchmark.mlir \
+  mlir/test/Dialect/GPU/bias-add-runtime-shape.mlir \
   -pass-pipeline='builtin.module(gpu-scalar-hoist)'
 ```
 
@@ -153,12 +154,12 @@ host function wrapping the magic-number computation.
 **Platform:** Intel Data Center GPU Max 1550 (Ponte Vecchio), 128 GB HBM2e
 **Profiling:** Intel unitrace (Level Zero kernel timing)
 
-#### BiasAdd (MLIR, 64M elements, 256MB f32)
+#### BiasAdd (MLIR, 32M elements, 128MB f32)
 
 | Configuration | Elements | Kernel Args | Avg Latency (ns) | Speedup |
 |---------------|----------|-------------|-------------------|---------|
-| Baseline      | 67,108,864 | 6         | 588,641           | —       |
-| **Optimized** | 67,108,864 | **10**    | **518,163**       | **+13.6%** |
+| Baseline      | 33,554,432 | 6         | 284,981           | —       |
+| **Optimized** | 33,554,432 | **10**    | **239,836**       | **+18.8%** |
 
 #### GroupNorm (SYCL, N=1024 D=192 S=784, Welford + affine norm)
 
@@ -290,5 +291,5 @@ dialect ops are erased, leaving only standard arith/math ops.
 | `mlir/include/mlir/Dialect/GPU/Transforms/ScalarHoistDialect.h` | Dialect definition (header-only) |
 | `mlir/include/mlir/Dialect/GPU/Transforms/Passes.td` | Pass registration |
 | `mlir/include/mlir/Dialect/GPU/Transforms/Passes.h` | Pass declarations |
-| `mlir/test/Dialect/GPU/bias-add-benchmark.mlir` | BiasAdd benchmark (64M elements) |
+| `mlir/test/Dialect/GPU/bias-add-runtime-shape.mlir` | BiasAdd MLIR benchmark (32M elements, 128MB) |
 | `mlir/test/Dialect/GPU/PATENT_SCALAR_HOIST.md` | Patent document |

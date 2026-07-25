@@ -1350,7 +1350,6 @@ visible to a single compiler pass, enabling the pass to simultaneously
 | `mlir/include/mlir/Dialect/GPU/Transforms/Passes.td` | Pass registration (TableGen) |
 | `mlir/include/mlir/Dialect/GPU/Transforms/Passes.h` | Pass declarations |
 | `mlir/lib/Dialect/GPU/CMakeLists.txt` | Build configuration |
-| `mlir/test/Dialect/GPU/bias-add-benchmark.mlir` | BiasAdd MLIR benchmark (64M elements, f32) |
 | `mlir/test/Dialect/GPU/bias-add-runtime-shape.mlir` | BiasAdd MLIR benchmark (32M elements, index-typed args) |
 | `mlir/test/Dialect/GPU/sycl/group-norm-baseline.cpp` | GroupNorm SYCL baseline (runtime division) |
 | `mlir/test/Dialect/GPU/sycl/group-norm-optimized.cpp` | GroupNorm SYCL optimized (host-precomputed magic multiply) |
