@@ -945,9 +945,9 @@ func.func @main() {
 
 | Configuration | Elements  | Blocks x Threads | Kernel Args | Avg Latency (ns) | Min Latency (ns) |
 |---------------|-----------|-------------------|-------------|-------------------|-------------------|
-| Baseline      | 67,108,864 | 262,144 x 256    | 6           | 588,682           | 580,160           |
-| **Optimized** | 67,108,864 | 262,144 x 256    | **10**      | **498,727**       | **492,160**       |
-| **Speedup**   |           |                   |             | **+18.0%**        | **+17.9%**        |
+| Baseline      | 67,108,864 | 262,144 x 256    | 6           | 588,641           | 579,840           |
+| **Optimized** | 67,108,864 | 262,144 x 256    | **10**      | **518,163**       | **507,680**       |
+| **Speedup**   |           |                   |             | **+13.6%**        | **+14.2%**        |
 
 **Analysis:**
 - Each work-item originally performs 2 integer divisions (`remui` + `divui`),
@@ -955,10 +955,10 @@ func.func @main() {
 - After optimization, each work-item performs 2 magic-multiply sequences,
   costing ~16-20 GPU cycles.
 - Net saving: ~24-140 cycles per work-item x 67M work-items.
-- The 18% speedup on a 64M-element kernel demonstrates that integer
+- The 13-14% speedup on a 64M-element kernel demonstrates that integer
   division overhead is significant even in memory-bandwidth-bound workloads
   (512 MB data movement). In compute-bound kernels with higher division
-  density, speedups of 25%+ have been observed.
+  density, larger speedups are expected.
 - Host-side precomputation cost: ~20 ns total for 4 values (2 magic +
   2 shift), negligible compared to the ~500 us kernel execution.
 
@@ -980,7 +980,9 @@ The pass integrates into the standard MLIR GPU compilation pipeline:
 Source (SYCL / OpenCL / CUDA)
   -> Clang Frontend
   -> MLIR (gpu + func + arith + memref + scf dialects)
-  -> [gpu-scalar-hoist]                    <-- THIS INVENTION
+  -> [gpu-scalar-hoist]                    <-- THIS INVENTION (Phase 1-4)
+  ->   emits scalar_hoist.precompute / scalar_hoist.yield ops
+  -> [lower-scalar-hoist]                  <-- Inline precompute regions
   -> [spirv-attach-target]
   -> [convert-gpu-to-spirv]
   -> [gpu.module(spirv.module(spirv-lower-abi-attrs, spirv-update-vce))]
@@ -998,6 +1000,54 @@ when the host-device boundary (`gpu.launch_func` in host `func.func`,
 advantage of the device-aware IR approach: the pass can reason about
 both sides of the boundary simultaneously.
 
+### THE scalar_hoist DIALECT
+
+The `scalar_hoist` dialect makes the cross-boundary precomputation
+explicit and visible in IR dumps. It defines two ops:
+
+| Op | Description |
+|----|-------------|
+| `scalar_hoist.precompute` | Region op. Takes scalar kernel-arg values as inputs; the region body computes the precomputed values (e.g., magic number and shift); yields results. |
+| `scalar_hoist.yield` | Terminator for the precompute region. Returns computed values to the parent op's results. |
+
+**Intermediate IR after `gpu-scalar-hoist` (before lowering):**
+
+```mlir
+func.func @main() {
+    %hw  = arith.constant 262144 : i32
+    %chw = arith.constant 4194304 : i32
+    // ...
+
+    // Host-side precomputation wrapped in scalar_hoist dialect op
+    %magic_hw, %shift_hw = "scalar_hoist.precompute"(%hw) ({
+    ^bb0(%d: i32):
+        %c1  = arith.constant 1 : i32
+        %dm1 = arith.subi %d, %c1 : i32
+        %clz = math.ctlz %dm1 : i32
+        %c32 = arith.constant 32 : i32
+        %s   = arith.subi %c32, %clz : i32
+        %d64 = arith.extui %d : i32 to i64
+        // ... 64-bit magic number computation ...
+        %m   = arith.trunci %m64 : i64 to i32
+        "scalar_hoist.yield"(%m, %s) : (i32, i32) -> ()
+    }) : (i32) -> (i32, i32)
+
+    %magic_chw, %shift_chw = "scalar_hoist.precompute"(%chw) ({
+    ^bb0(%d: i32):
+        // ... same magic computation for chw ...
+        "scalar_hoist.yield"(%m, %s) : (i32, i32) -> ()
+    }) : (i32) -> (i32, i32)
+
+    // Kernel launch with precomputed values as extra args
+    gpu.launch_func @kernel::@kernel ...
+        args(..., %magic_hw, %shift_hw, %magic_chw, %shift_chw)
+}
+```
+
+After `lower-scalar-hoist`, the precompute regions are inlined into the
+parent block and the dialect ops are erased, leaving only standard
+arith/math operations ready for LLVM lowering.
+
 ---
 
 ### PASS REGISTRATION
@@ -1010,12 +1060,24 @@ def GpuScalarHoistPass : Pass<"gpu-scalar-hoist", "ModuleOp"> {
     is a uniform scalar kernel argument. Hoists magic/shift precomputation
     to the host (before gpu.launch_func) and replaces kernel division with
     magic multiply (mul_hi + add + shift).
+
+    Host-side precomputation is wrapped in scalar_hoist.precompute ops.
+    Run lower-scalar-hoist after this pass to inline them.
   }];
   let dependentDialects = [
     "mlir::gpu::GPUDialect", "mlir::arith::ArithDialect",
     "mlir::math::MathDialect", "mlir::memref::MemRefDialect",
     "mlir::func::FuncDialect", "mlir::scf::SCFDialect"
   ];
+}
+
+def LowerScalarHoistPass : Pass<"lower-scalar-hoist", "ModuleOp"> {
+  let summary = "Lower scalar_hoist dialect ops to standard operations";
+  let description = [{
+    Inlines scalar_hoist.precompute regions into the parent block and
+    erases the wrapper ops, producing standard arith/math operations
+    in the host function. Must run before convert-to-llvm.
+  }];
 }
 ```
 
@@ -1094,8 +1156,10 @@ visible to a single compiler pass, enabling the pass to simultaneously
 
 | File | Description |
 |------|-------------|
-| `mlir/lib/Dialect/GPU/Transforms/ScalarHoist.cpp` | Pass implementation (374 lines) |
+| `mlir/lib/Dialect/GPU/Transforms/ScalarHoist.cpp` | Main pass: classify, hoist, emit `scalar_hoist` ops |
+| `mlir/lib/Dialect/GPU/Transforms/LowerScalarHoist.cpp` | Lowering pass: inline precompute regions |
+| `mlir/include/mlir/Dialect/GPU/Transforms/ScalarHoistDialect.h` | `scalar_hoist` dialect definition (header-only) |
 | `mlir/include/mlir/Dialect/GPU/Transforms/Passes.td` | Pass registration (TableGen) |
-| `mlir/include/mlir/Dialect/GPU/Transforms/Passes.h` | Pass declaration |
+| `mlir/include/mlir/Dialect/GPU/Transforms/Passes.h` | Pass declarations |
 | `mlir/lib/Dialect/GPU/CMakeLists.txt` | Build configuration |
-| `mlir/test/Dialect/GPU/bias-add-benchmark.mlir` | Benchmark (64M elements, f32) |
+| `mlir/test/Dialect/GPU/bias-add-benchmark.mlir` | BiasAdd benchmark (64M elements, f32) |

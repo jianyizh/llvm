@@ -7,7 +7,8 @@ This guide documents how to build a full MLIR pipeline capable of running
 intel/llvm `sycl` branch.
 
 The pipeline enables:
-- Writing GPU kernels in MLIR `gpu.launch` dialect (host + device in same IR)
+- Writing GPU kernels in MLIR `gpu.func` / `gpu.launch_func` dialect
+- The `scalar_hoist` dialect for explicit host-side precomputation
 - Lowering through SPIR-V to Intel GPU ISA
 - JIT execution on Intel GPU via `mlir-runner` + Level Zero
 
@@ -25,14 +26,13 @@ sudo apt-get install -y libhwloc-dev opencl-headers
 
 ## 3. Source Code
 
-- **Repository**: `https://github.com/intel/llvm.git`
-- **Branch**: `sycl`
-- **Commit**: `f4ae903c9819` (or latest sycl branch)
+- **Repository**: `https://github.com/jianyizh/llvm.git`
+- **Branch**: `scalar-hoist`
 
 ```bash
-git clone https://github.com/intel/llvm.git
+git clone https://github.com/jianyizh/llvm.git
 cd llvm
-git checkout sycl
+git checkout scalar-hoist
 ```
 
 ## 4. Build
@@ -73,13 +73,23 @@ Expected output:
 [level_zero:gpu][level_zero:0] Intel(R) Data Center GPU Max 1550 ...
 ```
 
-## 6. Run Upstream GPU Test (Sanity Check)
+## 6. BiasAdd Benchmark — 64M Elements
+
+### Source File
+
+`mlir/test/Dialect/GPU/bias-add-benchmark.mlir`
+
+- Shape: `tot=67108864 (64M), N=16, C=16, HW=262144, chw=4194304`
+- Grid: `262144 blocks × 256 threads`
+- Each work-item: `arith.remui + arith.divui + memref.load + arith.addf + memref.store`
+
+### Run Baseline (no optimization)
 
 ```bash
 BUILD=/home2/jianyizh/llvm/build_imex
 
 $BUILD/bin/mlir-opt \
-  $LLVM_SRC/mlir/test/Integration/GPU/LevelZero/gpu-addf32-to-spirv.mlir \
+  mlir/test/Dialect/GPU/bias-add-benchmark.mlir \
   -pass-pipeline='builtin.module(
     spirv-attach-target{ver=v1.0 caps=Addresses,Int64,Kernel},
     convert-gpu-to-spirv{use-64bit-index=true},
@@ -92,27 +102,22 @@ $BUILD/bin/mlir-opt \
     expand-strided-metadata,
     lower-affine,
     reconcile-unrealized-casts
-  )' \
-| LD_LIBRARY_PATH=$BUILD/lib \
-  $BUILD/bin/mlir-runner \
+  )' -o /tmp/ba_base.mlir
+
+LD_LIBRARY_PATH=$BUILD/lib unitrace -d $BUILD/bin/mlir-runner \
   --shared-libs=$BUILD/lib/libmlir_levelzero_runtime.so \
   --shared-libs=$BUILD/lib/libmlir_runner_utils.so \
-  --entry-point-result=void
-
-# Expected output:
-# Unranked Memref base@ = ... data = [[[2.3, 4.5], [7.8, 10.2]], ...
+  --entry-point-result=void /tmp/ba_base.mlir
 ```
 
-## 7. BiasAdd Benchmark (Runtime Scalar Division)
-
-### Benchmark Source
-
-File: `mlir/test/Dialect/GPU/bias-add-runtime-shape.mlir`
+### Run Optimized (with scalar_hoist dialect)
 
 ```bash
 $BUILD/bin/mlir-opt \
-  $LLVM_SRC/mlir/test/Dialect/GPU/bias-add-runtime-shape.mlir \
+  mlir/test/Dialect/GPU/bias-add-benchmark.mlir \
   -pass-pipeline='builtin.module(
+    gpu-scalar-hoist,
+    lower-scalar-hoist,
     spirv-attach-target{ver=v1.0 caps=Addresses,Int64,Kernel},
     convert-gpu-to-spirv{use-64bit-index=true},
     gpu.module(spirv.module(spirv-lower-abi-attrs,spirv-update-vce)),
@@ -124,71 +129,58 @@ $BUILD/bin/mlir-opt \
     expand-strided-metadata,
     lower-affine,
     reconcile-unrealized-casts
-  )' \
-| LD_LIBRARY_PATH=$BUILD/lib \
-  $BUILD/bin/mlir-runner \
+  )' -o /tmp/ba_opt.mlir
+
+LD_LIBRARY_PATH=$BUILD/lib unitrace -d $BUILD/bin/mlir-runner \
   --shared-libs=$BUILD/lib/libmlir_levelzero_runtime.so \
   --shared-libs=$BUILD/lib/libmlir_runner_utils.so \
-  --entry-point-result=void
-
-# Expected output:
-# Unranked Memref base@ = ... data = [1, 2, 3, 4, 6, 2, 2, 2, 3, 3, 3, 3]
+  --entry-point-result=void /tmp/ba_opt.mlir
 ```
 
-### Kernel Structure
+### Inspect Intermediate IR (dialect ops visible)
 
-```
-Host side (func.func @main):
-  %tot = arith.constant 12   ← could be any runtime value
-  %chw = arith.constant 12   ← scalar divisor #1
-  %hw  = arith.constant 4    ← scalar divisor #2
-  gpu.launch_func @bias_add_kernel args(..., %tot, %chw, %hw)
-
-Kernel side (gpu.func @bias_add_kernel):
-  %chw_i32 = arith.index_castui %chw : index to i32
-  %hw_i32  = arith.index_castui %hw  : index to i32
-  %rem = arith.remui %i, %chw_i32 : i32    ← target: division by scalar arg
-  %ch  = arith.divui %rem, %hw_i32 : i32   ← target: division by scalar arg
+```bash
+$BUILD/bin/mlir-opt \
+  mlir/test/Dialect/GPU/bias-add-benchmark.mlir \
+  -pass-pipeline='builtin.module(gpu-scalar-hoist)'
 ```
 
-### SPIR-V Lowering
+This shows `scalar_hoist.precompute` and `scalar_hoist.yield` ops in the
+host function wrapping the magic-number computation.
 
-The division ops lower to SPIR-V:
-```mlir
-%7 = spirv.UMod %2, %5 : i32       # i % chw
-%8 = spirv.UDiv %7, %6 : i32       # (i%chw) / hw
-```
+### Benchmark Results
 
-Where `%5` and `%6` are scalar kernel arguments (chw, hw converted to i32).
+**Platform:** Intel Data Center GPU Max 1550 (Ponte Vecchio), 128 GB HBM2e
+**Profiling:** Intel unitrace (Level Zero kernel timing)
 
-## 8. Optimization Target
+| Configuration | Elements | Kernel Args | Avg Latency (ns) | Speedup |
+|---------------|----------|-------------|-------------------|---------|
+| Baseline      | 67,108,864 | 6         | 588,641           | —       |
+| **Optimized** | 67,108,864 | **10**    | **518,163**       | **+13.6%** |
 
-The scalar hoisting pass should:
-1. Identify `arith.divui`/`arith.remui` ops in `gpu.func` bodies where the
-   divisor is a scalar kernel argument (uniform across all work-items).
-2. In the host function (before `gpu.launch_func`), insert magic/shift
-   precomputation for each scalar divisor.
-3. Add magic/shift as new kernel arguments.
-4. Replace kernel-side division with magic multiply:
-   `(mul_hi(magic, n) + n) >> shift`
-5. Update `gpu.launch_func` call args to include magic/shift values.
-
-## 9. MLIR Pass Pipeline Map
+## 7. Pass Pipeline (with scalar_hoist dialect)
 
 ```
-gpu.launch (host + device)
+Input MLIR (gpu.func + gpu.launch_func)
   │
-  ├─ spirv-attach-target     ← adds SPIR-V target to gpu.module
-  ├─ convert-gpu-to-spirv    ← lowers gpu ops → SPIR-V dialect
+  ├─ gpu-scalar-hoist          ← Phase 1: dependency classification
+  │                               Phase 2: find divui/remui by SCALAR_ONLY divisors
+  │                               Phase 3: wrap magic/shift in scalar_hoist.precompute
+  │                               Phase 4: replace kernel div with magic multiply
+  │
+  ├─ lower-scalar-hoist        ← Inline precompute regions, erase dialect ops
+  │
+  ├─ spirv-attach-target       ← Add SPIR-V target to gpu.module
+  ├─ convert-gpu-to-spirv      ← Lower gpu ops → SPIR-V dialect
   │    └─ gpu.module:
   │         ├─ spirv-lower-abi-attrs
   │         └─ spirv-update-vce
   ├─ func.func:
   │    └─ llvm-request-c-wrappers
-  ├─ convert-scf-to-cf       ← scf → cf
-  ├─ convert-to-llvm         ← remaining dialects → LLVM
-  ├─ gpu-to-llvm             ← gpu.launch_func → LLVM calls
-  ├─ gpu-module-to-binary    ← SPIR-V + target → embedded binary
+  ├─ convert-scf-to-cf
+  ├─ convert-to-llvm
+  ├─ gpu-to-llvm
+  ├─ gpu-module-to-binary{format=isa}
   ├─ expand-strided-metadata
   ├─ lower-affine
   └─ reconcile-unrealized-casts
@@ -198,3 +190,53 @@ gpu.launch (host + device)
          │
     mlir-runner + Level Zero → GPU execution
 ```
+
+## 8. scalar_hoist Dialect
+
+The `scalar_hoist` dialect wraps host-side precomputation in explicit
+IR ops, making the cross-boundary optimization visible and verifiable.
+
+### Ops
+
+| Op | Description |
+|----|-------------|
+| `scalar_hoist.precompute` | Region op wrapping host-side computation. Takes scalar inputs, yields precomputed values (magic, shift). |
+| `scalar_hoist.yield` | Terminator for precompute region. |
+
+### Intermediate IR Example
+
+After `gpu-scalar-hoist`, before `lower-scalar-hoist`:
+
+```mlir
+func.func @main() {
+    %hw = arith.constant 262144 : i32
+    // ...
+    %magic, %shift = "scalar_hoist.precompute"(%hw) ({
+    ^bb0(%d: i32):
+        %dm1  = arith.subi %d, %c1 : i32
+        %clz  = math.ctlz %dm1 : i32
+        %s    = arith.subi %c32, %clz : i32
+        // ... 64-bit magic number computation ...
+        %m    = arith.trunci %m64 : i64 to i32
+        "scalar_hoist.yield"(%m, %s) : (i32, i32) -> ()
+    }) : (i32) -> (i32, i32)
+
+    gpu.launch_func @kernel::@kernel ...
+        args(..., %magic : i32, %shift : i32)
+}
+```
+
+After `lower-scalar-hoist`, the precompute region is inlined and the
+dialect ops are erased, leaving only standard arith/math ops.
+
+## 9. Source Files
+
+| File | Description |
+|------|-------------|
+| `mlir/lib/Dialect/GPU/Transforms/ScalarHoist.cpp` | Main pass: classify + hoist + replace |
+| `mlir/lib/Dialect/GPU/Transforms/LowerScalarHoist.cpp` | Lowering pass: inline precompute regions |
+| `mlir/include/mlir/Dialect/GPU/Transforms/ScalarHoistDialect.h` | Dialect definition (header-only) |
+| `mlir/include/mlir/Dialect/GPU/Transforms/Passes.td` | Pass registration |
+| `mlir/include/mlir/Dialect/GPU/Transforms/Passes.h` | Pass declarations |
+| `mlir/test/Dialect/GPU/bias-add-benchmark.mlir` | BiasAdd benchmark (64M elements) |
+| `mlir/test/Dialect/GPU/PATENT_SCALAR_HOIST.md` | Patent document |
