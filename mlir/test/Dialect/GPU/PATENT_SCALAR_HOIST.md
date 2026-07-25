@@ -946,12 +946,12 @@ implemented benchmark.
 module @bias_add attributes {gpu.container_module} {
   gpu.module @bias_add_kernel attributes {spirv.target_env = ...} {
     gpu.func @bias_add_kernel(
-        %src: memref<67108864xf32>,     // source buffer (64M f32)
-        %bias: memref<16xf32>,          // per-channel bias (16 channels)
-        %dst: memref<67108864xf32>,     // destination buffer
-        %tot: i32,                      // total elements = 67108864
-        %chw: i32,                      // channels * H * W = 4194304
-        %hw: i32                        // H * W = 262144
+        %src: memref<33554432xf32>,     // source buffer (32M f32, 128MB)
+        %bias: memref<64xf32>,          // per-channel bias (64 channels)
+        %dst: memref<33554432xf32>,     // destination buffer
+        %tot: index,                    // total elements = 33554432
+        %chw: index,                    // C*H*W = 4194304
+        %hw: index                      // H*W = 65536
     ) kernel attributes {
         gpu.known_block_size = array<i32: 256, 1, 1>
     } {
@@ -961,34 +961,37 @@ module @bias_add attributes {gpu.container_module} {
       %gid0 = arith.muli %bx, %bs : index            // INDEX_ONLY
       %gid = arith.addi %tx, %gid0 : index           // INDEX_ONLY
       %i = arith.index_castui %gid : index to i32    // INDEX_ONLY
-      %is_in = arith.cmpi ult, %i, %tot : i32        // MIXED
+      %tot_i32 = arith.index_castui %tot : index to i32 // SCALAR_ONLY
+      %is_in = arith.cmpi ult, %i, %tot_i32 : i32   // MIXED
       scf.if %is_in {
+        %chw_i32 = arith.index_castui %chw : index to i32 // SCALAR_ONLY
+        %hw_i32 = arith.index_castui %hw : index to i32   // SCALAR_ONLY
         // TARGET: runtime division by uniform scalar args
-        %rem = arith.remui %i, %chw : i32   // MIXED (INDEX % SCALAR)
-        %ch  = arith.divui %rem, %hw : i32  // MIXED (MIXED / SCALAR)
+        %rem = arith.remui %i, %chw_i32 : i32  // MIXED (INDEX % SCALAR)
+        %ch  = arith.divui %rem, %hw_i32 : i32 // MIXED (MIXED / SCALAR)
         %ci  = arith.index_castui %ch : i32 to index
         %idx = arith.index_castui %i : i32 to index
-        %s = memref.load %src[%idx] : memref<67108864xf32>
-        %b = memref.load %bias[%ci] : memref<16xf32>
+        %s = memref.load %src[%idx] : memref<33554432xf32>
+        %b = memref.load %bias[%ci] : memref<64xf32>
         %r = arith.addf %s, %b : f32
-        memref.store %r, %dst[%idx] : memref<67108864xf32>
+        memref.store %r, %dst[%idx] : memref<33554432xf32>
       }
       gpu.return
     }
   }
 
   func.func @main() {
-    %tot = arith.constant 67108864 : i32
-    %chw = arith.constant 4194304 : i32
-    %hw  = arith.constant 262144 : i32
+    %tot = arith.constant 33554432 : index
+    %chw = arith.constant 4194304 : index
+    %hw  = arith.constant 65536 : index
     // ... gpu.alloc, warmup loop, benchmark loop ...
     scf.for %b = %c0 to %c100 step %c1 {
       gpu.launch_func @bias_add_kernel::@bias_add_kernel
         blocks in (%blocks, %c1, %c1) threads in (%c256, %c1, %c1)
-        args(%mem_src : memref<67108864xf32>,
-             %mem_bias : memref<16xf32>,
-             %mem_dst : memref<67108864xf32>,
-             %tot : i32, %chw : i32, %hw : i32)
+        args(%mem_src : memref<33554432xf32>,
+             %mem_bias : memref<64xf32>,
+             %mem_dst : memref<33554432xf32>,
+             %tot : index, %chw : index, %hw : index)
     }
     return
   }
@@ -997,84 +1000,86 @@ module @bias_add attributes {gpu.container_module} {
 
 #### Phase 1 Classification Result
 
-| Value    | Type      | Classification | Reason                        |
-|----------|-----------|----------------|-------------------------------|
-| `%src`   | memref    | INDEX_ONLY     | MemRef kernel arg             |
-| `%bias`  | memref    | INDEX_ONLY     | MemRef kernel arg             |
-| `%dst`   | memref    | INDEX_ONLY     | MemRef kernel arg             |
-| `%tot`   | i32       | SCALAR_ONLY    | Scalar kernel arg             |
-| `%chw`   | i32       | SCALAR_ONLY    | Scalar kernel arg             |
-| `%hw`    | i32       | SCALAR_ONLY    | Scalar kernel arg             |
-| `%tx`    | index     | INDEX_ONLY     | gpu.thread_id                 |
-| `%bx`    | index     | INDEX_ONLY     | gpu.block_id                  |
-| `%bs`    | index     | SCALAR_ONLY    | gpu.block_dim                 |
-| `%gid0`  | index     | INDEX_ONLY     | INDEX * SCALAR -> INDEX       |
-| `%gid`   | index     | INDEX_ONLY     | INDEX + INDEX                 |
-| `%i`     | i32       | INDEX_ONLY     | cast of INDEX                 |
-| `%is_in` | i1        | MIXED          | INDEX < SCALAR                |
-| `%rem`   | i32       | MIXED          | INDEX % SCALAR                |
-| `%ch`    | i32       | MIXED          | MIXED / SCALAR                |
+| Value      | Type      | Classification | Reason                        |
+|------------|-----------|----------------|-------------------------------|
+| `%src`     | memref    | INDEX_ONLY     | MemRef kernel arg             |
+| `%bias`    | memref    | INDEX_ONLY     | MemRef kernel arg             |
+| `%dst`     | memref    | INDEX_ONLY     | MemRef kernel arg             |
+| `%tot`     | index     | SCALAR_ONLY    | Scalar kernel arg             |
+| `%chw`     | index     | SCALAR_ONLY    | Scalar kernel arg             |
+| `%hw`      | index     | SCALAR_ONLY    | Scalar kernel arg             |
+| `%tx`      | index     | INDEX_ONLY     | gpu.thread_id                 |
+| `%bx`      | index     | INDEX_ONLY     | gpu.block_id                  |
+| `%bs`      | index     | SCALAR_ONLY    | gpu.block_dim                 |
+| `%gid0`    | index     | INDEX_ONLY     | INDEX * SCALAR -> INDEX       |
+| `%gid`     | index     | INDEX_ONLY     | INDEX + INDEX                 |
+| `%i`       | i32       | INDEX_ONLY     | cast of INDEX                 |
+| `%chw_i32` | i32       | SCALAR_ONLY    | cast of SCALAR                |
+| `%hw_i32`  | i32       | SCALAR_ONLY    | cast of SCALAR                |
+| `%is_in`   | i1        | MIXED          | INDEX < SCALAR                |
+| `%rem`     | i32       | MIXED          | INDEX % SCALAR                |
+| `%ch`      | i32       | MIXED          | MIXED / SCALAR                |
 
 #### Phase 2 Candidates Found
 
-| Operation                        | Divisor | Classification | Scalar Operand |
-|----------------------------------|---------|----------------|----------------|
-| `%rem = arith.remui %i, %chw`   | `%chw`  | SCALAR_ONLY    | `%chw`         |
-| `%ch = arith.divui %rem, %hw`   | `%hw`   | SCALAR_ONLY    | `%hw`          |
+| Operation                            | Divisor    | Classification | Scalar Operand |
+|--------------------------------------|------------|----------------|----------------|
+| `%rem = arith.remui %i, %chw_i32`   | `%chw_i32` | SCALAR_ONLY   | `%chw_i32`    |
+| `%ch = arith.divui %rem, %hw_i32`   | `%hw_i32`  | SCALAR_ONLY   | `%hw_i32`     |
 
-Two unique scalar divisors: `%chw` and `%hw`. Two (magic, shift) pairs
-will be computed.
+Two unique scalar divisors: `%chw_i32` and `%hw_i32` (derived from
+index-typed kernel args via `arith.index_castui`). Two (magic, shift)
+pairs will be computed on the host.
 
 #### Output: Optimized MLIR
 
 ```mlir
 func.func @main() {
-    %tot = arith.constant 67108864 : i32
-    %chw = arith.constant 4194304 : i32
-    %hw  = arith.constant 262144 : i32
+    %tot = arith.constant 33554432 : index
+    %chw = arith.constant 4194304 : index
+    %hw  = arith.constant 65536 : index
     // ... gpu.alloc ...
 
     // === HOST-SIDE PRECOMPUTATION (generated by pass) ===
-    // Magic/shift for chw = 4194304:
-    %one     = arith.constant 1 : i32
-    %dm1_chw = arith.subi %chw, %one : i32
-    %clz_chw = math.ctlz %dm1_chw : i32
-    %c32     = arith.constant 32 : i32
-    %sh_chw  = arith.subi %c32, %clz_chw : i32     // shift for chw
-    // ... 64-bit magic computation for chw ...
-    %magic_chw = arith.trunci ... : i64 to i32      // magic for chw
+    // index -> i32 cast, then magic/shift wrapped in scalar_hoist.precompute
+    %hw_i32 = arith.index_castui %hw : index to i32
+    %magic_hw, %sh_hw = "scalar_hoist.precompute"(%hw_i32) ({
+    ^bb0(%d: i32):
+      // ... magic number computation ...
+      "scalar_hoist.yield"(%magic, %shift) : (i32, i32) -> ()
+    }) : (i32) -> (i32, i32)
 
-    // Magic/shift for hw = 262144:
-    %dm1_hw  = arith.subi %hw, %one : i32
-    %clz_hw  = math.ctlz %dm1_hw : i32
-    %sh_hw   = arith.subi %c32, %clz_hw : i32      // shift for hw
-    // ... 64-bit magic computation for hw ...
-    %magic_hw = arith.trunci ... : i64 to i32       // magic for hw
+    %chw_i32 = arith.index_castui %chw : index to i32
+    %magic_chw, %sh_chw = "scalar_hoist.precompute"(%chw_i32) ({
+    ^bb0(%d: i32):
+      // ... magic number computation ...
+      "scalar_hoist.yield"(%magic, %shift) : (i32, i32) -> ()
+    }) : (i32) -> (i32, i32)
 
     // === ALL launch_func calls updated with extra args ===
     scf.for %b = %c0 to %c100 step %c1 {
       gpu.launch_func @bias_add_kernel::@bias_add_kernel
         blocks in (%blocks, %c1, %c1) threads in (%c256, %c1, %c1)
-        args(%mem_src : memref<67108864xf32>,
-             %mem_bias : memref<16xf32>,
-             %mem_dst : memref<67108864xf32>,
-             %tot : i32, %chw : i32, %hw : i32,
-             %magic_chw : i32, %sh_chw : i32,    // NEW
-             %magic_hw : i32, %sh_hw : i32)       // NEW
+        args(%mem_src : memref<33554432xf32>,
+             %mem_bias : memref<64xf32>,
+             %mem_dst : memref<33554432xf32>,
+             %tot : index, %chw : index, %hw : index,
+             %magic_hw : i32, %sh_hw : i32,       // NEW
+             %magic_chw : i32, %sh_chw : i32)     // NEW
     }
     return
   }
 
   // === OPTIMIZED KERNEL (4 extra args, no divui/remui) ===
   gpu.func @bias_add_kernel(
-      %src: memref<67108864xf32>, %bias: memref<16xf32>,
-      %dst: memref<67108864xf32>, %tot: i32, %chw: i32, %hw: i32,
-      %magic_chw: i32, %shift_chw: i32,      // precomputed for chw
-      %magic_hw: i32, %shift_hw: i32         // precomputed for hw
+      %src: memref<33554432xf32>, %bias: memref<64xf32>,
+      %dst: memref<33554432xf32>, %tot: index, %chw: index, %hw: index,
+      %magic_hw: i32, %shift_hw: i32,        // precomputed for hw
+      %magic_chw: i32, %shift_chw: i32       // precomputed for chw
   ) kernel {
     // ... compute %i as before ...
     scf.if %is_in {
-      // BEFORE: %rem = arith.remui %i, %chw : i32
+      // BEFORE: %rem = arith.remui %i, %chw_i32 : i32
       // AFTER:  magic multiply for rem
       %m64_chw = arith.extui %magic_chw : i32 to i64
       %n64_chw = arith.extui %i : i32 to i64
@@ -1083,10 +1088,10 @@ func.func @main() {
       %hi32_chw = arith.trunci %hi_chw : i64 to i32
       %sum_chw = arith.addi %hi32_chw, %i : i32
       %quot_chw = arith.shrui %sum_chw, %shift_chw : i32
-      %prod_chw = arith.muli %quot_chw, %chw : i32
+      %prod_chw = arith.muli %quot_chw, %chw_i32 : i32
       %rem = arith.subi %i, %prod_chw : i32         // remainder
 
-      // BEFORE: %ch = arith.divui %rem, %hw : i32
+      // BEFORE: %ch = arith.divui %rem, %hw_i32 : i32
       // AFTER:  magic multiply for div
       %m64_hw  = arith.extui %magic_hw : i32 to i64
       %n64_hw  = arith.extui %rem : i32 to i64
@@ -1113,14 +1118,15 @@ func.func @main() {
 #### Benchmark 1: BiasAdd (MLIR pipeline, memory-bandwidth-bound)
 
 Kernel: `dst[i] = src[i] + bias[(i % chw) / hw]`
-- 2 integer divisions per work-item, 67M work-items
-- Memory-bandwidth-bound (512 MB data movement dominates)
+- 2 integer divisions per work-item, 32M work-items
+- Shape: N=8, C=64, H=256, W=256 (tot=33,554,432, 128MB per buffer)
+- Memory-bandwidth-bound (256 MB total data movement dominates)
 
 | Configuration | Elements  | Blocks x Threads | Kernel Args | Avg Latency (ns) |
 |---------------|-----------|-------------------|-------------|-------------------|
-| Baseline      | 67,108,864 | 262,144 x 256    | 6           | 588,641           |
-| **Optimized** | 67,108,864 | 262,144 x 256    | **10**      | **518,163**       |
-| **Speedup**   |           |                   |             | **+13.6%**        |
+| Baseline      | 33,554,432 | 131,072 x 256    | 6           | 284,981           |
+| **Optimized** | 33,554,432 | 131,072 x 256    | **10**      | **239,836**       |
+| **Speedup**   |           |                   |             | **+18.8%**        |
 
 #### Benchmark 2: GroupNorm (SYCL, compute-bound)
 
