@@ -82,7 +82,7 @@ Expected output:
 - Shape: `N=8, C=64, H=256, W=256 => tot=33554432 (32M, 128MB f32)`
 - `chw = C*H*W = 4194304, hw = H*W = 65536`
 - Grid: `131072 blocks × 256 threads`
-- Each work-item: `arith.remui + arith.divui + memref.load + arith.addf + memref.store`
+- Each work-item: `index_castui + remui + divui + load + addf + store`
 
 ### Run Baseline (no optimization)
 
